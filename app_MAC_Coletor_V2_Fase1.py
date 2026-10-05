@@ -170,9 +170,30 @@ def parse_number(value):
 
 
 def get_html(url, timeout=25):
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r
+    # Duas tentativas apenas para falhas transitórias; sucesso nunca é repetido.
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt:
+                raise
+        except requests.HTTPError as exc:
+            if attempt or exc.response.status_code not in {429, 502, 503, 504}:
+                raise
+
+
+def fetch_cartola_page(target, timeout):
+    url = target["url_cartola_brasil"]
+    try:
+        return get_html(url, timeout=timeout)
+    except requests.TooManyRedirects:
+        # Recomeçar pelo ID, sem carregar um apelido/slug possivelmente antigo.
+        # Um único endereço alternativo, sem busca ilimitada.
+        canonical = url.rsplit("/", 1)[0] + "/"
+        response = get_html(canonical, timeout=timeout)
+        return response
 
 
 def get_json(url, timeout=25):
@@ -310,7 +331,7 @@ def total_games(text):
 
 
 def fetch_cartola_history(target, rodada_referencia, janela, timeout=25):
-    r = get_html(target["url_cartola_brasil"], timeout=timeout)
+    r = fetch_cartola_page(target, timeout)
     final_url = r.url
     soup = BeautifulSoup(r.text, "html.parser")
     text = clean(soup.get_text(" ", strip=True))
@@ -330,16 +351,24 @@ def fetch_cartola_history(target, rodada_referencia, janela, timeout=25):
         inconsistencias.append(
             f"ID mercado {target['atleta_id']} / site {id_url}"
         )
-    if posicao_site != target["posicao"]:
+    if posicao_site is not None and posicao_site != target["posicao"]:
         inconsistencias.append(
             f"posição mercado {target['posicao']} / site {posicao_site}"
         )
 
-    n1, n2 = norm(target["nome_mercado"]), norm(nome_site)
-    if n1 and n2 and not (n1 == n2 or n1 in n2 or n2 in n1):
-        inconsistencias.append(
-            f"nome mercado '{target['nome_mercado']}' / site '{nome_site}'"
-        )
+    if clube_site:
+        site_club = STATZ_TEAM_TO_ABBR.get(norm(clube_site))
+        if norm(clube_site) == norm(target.get("clube_abreviacao")):
+            site_club = target.get("clube_abreviacao")
+        if site_club and site_club != target.get("clube_abreviacao"):
+            inconsistencias.append(f"clube mercado {target.get('clube_abreviacao')} / site {site_club}")
+
+    # O ID oficial confirmado permite variação de apelido. Posição ausente
+    # conserva a oficial; posição explicitamente divergente continua bloqueada.
+    identity_audit = {"id_oficial": target["atleta_id"], "id_pagina": id_url,
+                      "nome_cartola": target["nome_mercado"], "nome_pagina": nome_site,
+                      "posicao_cartola": target["posicao"], "posicao_pagina": posicao_site,
+                      "metodo": "id_oficial_confirmado_na_url"}
 
     if inconsistencias:
         raise ValueError("TRAVA DE IDENTIDADE: " + "; ".join(inconsistencias))
@@ -367,7 +396,8 @@ def fetch_cartola_history(target, rodada_referencia, janela, timeout=25):
             })
 
     return {
-        "nome_site": nome_site or target["nome_mercado"],
+        "nome_site": target["nome_mercado"],
+        "validacao_identidade": identity_audit,
         "clube_site": clube_site or target["clube"],
         "posicao_site": posicao_site or target["posicao"],
         "jogos_temporada": total_games(text) or target["jogos_mercado"],
@@ -502,18 +532,21 @@ def resolve_statz_player(target, cache):
             "fonte_url": squad.get("url"),
         }
 
+    aliases = {norm(target.get("nome_mercado")), norm(target.get("nome_completo"))} - {""}
     q = norm(target["nome_mercado"])
-
-    exact = [p for p in players if p["name_norm"] == q]
+    exact = [p for p in players if p["name_norm"] in aliases]
     if len(exact) == 1:
-        return exact[0], {"status": "ok", "metodo": "nome_exato"}
-
-    contains = [
-        p for p in players
-        if len(q) >= 4 and (q in p["name_norm"] or p["name_norm"] in q)
-    ]
+        return exact[0], {"status": "ok", "metodo": "nome_exato_ou_completo"}
+    if len(exact) > 1:
+        return None, {"status": "inconsistente", "motivo": "nomes_exatos_ambiguos", "fonte_url": squad.get("url")}
+    contains = [p for p in players if any(
+        min(len(alias), len(p["name_norm"])) >= 4 and
+        (f" {alias} " in f" {p['name_norm']} " or f" {p['name_norm']} " in f" {alias} ")
+        for alias in aliases)]
     if len(contains) == 1:
-        return contains[0], {"status": "ok", "metodo": "nome_contido"}
+        return contains[0], {"status": "ok", "metodo": "nome_contido_ou_completo_unico"}
+    if len(contains) > 1:
+        return None, {"status": "inconsistente", "motivo": "nomes_contidos_ambiguos", "fonte_url": squad.get("url")}
 
     q_tokens = {x for x in q.split() if len(x) >= 3}
     token_matches = []
@@ -625,6 +658,8 @@ def parse_statz_matches(html):
     return rows[:5], {
         "status": "ok" if rows else "sem_atuacoes_suficientes",
         "cabecalhos": headers,
+        "n_atuacoes_brasileirao_visiveis": len(rows),
+        "cobertura_historico": "apenas_partidas_expostas_na_pagina; completude_anterior_nao_confirmada",
     }
 
 
@@ -1147,7 +1182,8 @@ def collect_one_player(target, rodada, janela, squad_cache):
 
     cartola = fetch_cartola_history(target, rodada, janela)
     base.update({
-        "jogador": cartola["nome_site"] or target["nome_mercado"],
+        "jogador": target["nome_mercado"],
+        "validacao_identidade_historico": cartola["validacao_identidade"],
         "clube": cartola["clube_site"] or target["clube"],
         "posicao": cartola["posicao_site"] or target["posicao"],
         "jogos_temporada": cartola["jogos_temporada"],
@@ -1368,7 +1404,7 @@ if mercado:
         # Coleta de jogadores em paralelo; o cache de elenco é compartilhado
         # apenas como otimização. Em caso de corrida, a pior consequência é uma
         # repetição de request, nunca alteração de dado.
-        max_workers = min(5, max(1, len(escolhidos)))
+        max_workers = min(3, max(1, len(escolhidos)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
