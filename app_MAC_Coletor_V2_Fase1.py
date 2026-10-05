@@ -652,6 +652,32 @@ def cell_text(cells, hmap, key):
     return clean(cells[idx].get_text(" ", strip=True))
 
 
+def fetch_statz_round_index(season):
+    response = get_html(f"{STATZ_FIXTURES}?season={int(season)}", timeout=35)
+    soup = BeautifulSoup(response.text, "html.parser")
+    node = soup.find(attrs={"data-page": True})
+    props = json.loads(node["data-page"]).get("props", {}) if node else {}
+    if str(props.get("hero", {}).get("season")) != str(season):
+        raise ValueError("temporada_tabela_rodadas_incompativel")
+    index = {}
+    for week in props.get("matchweeks", []):
+        number = week.get("number")
+        if not isinstance(number, int) or number <= 0:
+            raise ValueError("numero_rodada_invalido")
+        for day in week.get("days", []):
+            for fixture in day.get("fixtures", []):
+                key = str(fixture["id"])
+                if key in index:
+                    raise ValueError("partida_duplicada_tabela_rodadas")
+                index[key] = {"rodada": number, "data_iso": fixture.get("kickoff_iso"),
+                              "clube_mandante": fixture.get("home_team", {}).get("name"),
+                              "clube_visitante": fixture.get("away_team", {}).get("name"),
+                              "fonte_rodada_url": response.url}
+    if not index:
+        raise ValueError("tabela_rodadas_vazia")
+    return index
+
+
 def parse_statz_season_matches(props, season):
     source_rows = props.get("modules", {}).get("window", {}).get("rows")
     if not isinstance(source_rows, list):
@@ -910,6 +936,15 @@ def fetch_statz_production(target, squad_cache):
                          "competicao_id_confirmada": 648,
                          "limite_resposta": props.get("limit"),
                          "cobertura_historico": "competicao_e_temporada_filtradas_antes_da_janela"})
+    round_index = squad_cache.get("_rodadas_statz", {})
+    for match in matches:
+        fixture = round_index.get(str(match["fixture_id"]))
+        match["rodada"] = fixture.get("rodada") if fixture else None
+        match["fonte_rodada"] = "statz_fixture_id" if fixture else None
+        match["fonte_rodada_url"] = fixture.get("fonte_rodada_url") if fixture else None
+        match["status_vinculo_rodada"] = "confirmado_por_id_partida" if fixture else "pendente"
+    parse_status["rodadas_confirmadas"] = sum(m["rodada"] is not None for m in matches)
+    parse_status["rodadas_pendentes"] = sum(m["rodada"] is None for m in matches)
     production = build_production(target, matches, r.url)
     production["resolucao_identidade_statz"] = {
         **resolution,
@@ -1498,6 +1533,12 @@ if mercado:
         status_box.write("Descobrindo os endereços atuais dos clubes no Statz...")
         descoberta_clubes = discover_statz_clubs()
         squad_cache = {"_descoberta_clubes": descoberta_clubes}
+        rodada_vinculo_erro = None
+        try:
+            squad_cache["_rodadas_statz"] = fetch_statz_round_index(mercado["temporada"])
+        except Exception as exc:
+            rodada_vinculo_erro = str(exc)
+            squad_cache["_rodadas_statz"] = {}
 
         # Coleta de jogadores em paralelo; o cache de elenco é compartilhado
         # apenas como otimização. Em caso de corrida, a pior consequência é uma
@@ -1636,6 +1677,11 @@ if mercado:
                 "amostras_reduzidas": amostras_reduzidas,
                 "descoberta_clubes_statz": descoberta_clubes,
                 "erro_referencias_individuais": referencia_erro,
+                "erro_vinculo_rodadas": rodada_vinculo_erro,
+                "atuacoes_sem_rodada": sum(m.get("rodada") is None for player in resultados
+                                           for m in player.get("producao", {}).get("amostra", {}).get("partidas", [])),
+                "corte_historico_por_rodada": "ainda_nao_aplicado; coleta representa dados atuais",
+                "equivalencia_rodada_cartola": "nao_validada; rodada das atuacoes vem do Statz",
                 "protocolo_fallback": "pendente_fase_2",
                 "proxima_acao": (
                     "implementar fonte alternativa finita; revisar referencias ausentes, se houver"
