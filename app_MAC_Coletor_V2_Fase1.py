@@ -955,7 +955,8 @@ def build_individual_references(rows, season, source_url):
     eligible = [r for r in rows if isinstance(r.get("mins"), (int, float))
                 and r["mins"] > 0]
     unclassified = [{"id": r.get("id"), "jogador": r.get("name"),
-                     "minutos": r["mins"]}
+                     "minutos": r["mins"], "posicao_fonte": r.get("pd"),
+                     "motivo": "posicao_ausente_ou_nao_reconhecida"}
                     for r in eligible if positions.get(r.get("pd")) is None]
     result = {}
     for position, rules in PRODUCTION_RULES.items():
@@ -963,9 +964,15 @@ def build_individual_references(rows, season, source_url):
         metrics = [(name, fields[field]) for name, field, _ in rules]
         if position != "GOL":
             metrics.append(("gols_assistencias", "ga"))
+            metrics.append(("minutos", "minutes_per_appearance"))
         for metric, field in metrics:
             values = []
             for row in group:
+                if field == "minutes_per_appearance":
+                    appearances = row.get("apps")
+                    if isinstance(appearances, (int, float)) and appearances > 0:
+                        values.append(row["mins"] / appearances)
+                    continue
                 value = (row.get("g") + row.get("a")
                          if field == "ga" and isinstance(row.get("g"), (int, float))
                          and isinstance(row.get("a"), (int, float))
@@ -976,16 +983,28 @@ def build_individual_references(rows, season, source_url):
             result[f"{position}_{metric}"] = {
                 "competicao": "Campeonato Brasileiro", "temporada": season,
                 "universo": "jogadores com posicao identificada na base da competicao e minutos > 0",
-                "posicao": position, "metrica": metric, "unidade": "por 90 minutos",
-                "definicao": "media aritmetica das taxas individuais por 90 da temporada; producao L5 deve ser comparada por 90",
+                "posicao": position, "metrica": metric,
+                "unidade": "minutos por participacao" if field == "minutes_per_appearance" else "por 90 minutos",
+                "definicao": (
+                    "media aritmetica de minutos/apps de cada jogador da posicao na temporada"
+                    if field == "minutes_per_appearance" else
+                    "media aritmetica das taxas individuais por 90 da temporada; producao L5 deve ser comparada por 90"
+                ),
                 "valor": round(sum(values) / len(values), 4) if complete else None,
                 "n_elementos": len(group), "n_com_metrica": len(values),
                 "jogadores_sem_posicao_na_base": unclassified,
+                "excluidos_da_base_referencia": unclassified,
+                "n_excluidos_sem_posicao": len(unclassified),
+                "criterio_exclusao": "excluir automaticamente posição ausente ou não reconhecida; não inferir posição",
                 "fonte_id": "statz", "fonte_url": source_url,
-                "metodo": "base_completa_em_lote_media_taxas_individuais",
+                "metodo": (
+                    "base_em_lote_media_minutos_por_participacao_individual"
+                    if field == "minutes_per_appearance" else
+                    "base_completa_em_lote_media_taxas_individuais"
+                ),
                 "criterio_minutos": "> 0; sem filtro arbitrario de titularidade",
                 "mapeamento_posicoes": [k for k, v in positions.items() if v == position],
-                "status": ("parcial" if unclassified else "ok") if complete else "ausente_fonte_prioritaria",
+                "status": "ok" if complete else "ausente_fonte_prioritaria",
             }
     return result
 
@@ -1039,6 +1058,16 @@ def build_competition_references(collectives, season):
                 "metodo": None,
                 "status": "ausente_fonte_prioritaria",
                 "motivo": "base completa por posicao nao disponivel nesta coleta; ranking parcial nao representa o universo",
+            }
+        if position != "GOL":
+            references[f"{position}_minutos"] = {
+                "competicao": "Campeonato Brasileiro", "temporada": season,
+                "universo": "jogadores da posicao com minutos > 0 e posicao conhecida",
+                "posicao": position, "metrica": "minutos",
+                "unidade": "minutos por participacao",
+                "definicao": "media aritmetica de minutos/apps de cada jogador da posicao na temporada",
+                "valor": None, "n_elementos": 0, "fonte_id": "statz",
+                "metodo": None, "status": "ausente_fonte_prioritaria",
             }
     return references
 
@@ -1108,7 +1137,8 @@ st.caption("Produção L5 + histórico individual + coletivos L5 | Fase operacio
 st.info(
     "Nesta fase V2 já entram Produção individual via Statz e coletivos L5. "
     "As referências coletivas usam os 20 clubes. As individuais usam a base "
-    "da competição por posição e por 90 minutos; cobertura incompleta é sinalizada."
+    "da competição por posição e por 90 minutos. Jogadores sem posição "
+    "são excluídos das referências e registrados no JSON."
 )
 
 if "mercado" not in st.session_state:
@@ -1449,6 +1479,14 @@ if payload:
         )
     if cp.get("amostras_reduzidas", 0):
         st.info(f"{cp['amostras_reduzidas']} jogador(es) com menos de 5 atuações disponíveis.")
+    excluded = {
+        item["id"]: item
+        for reference in payload.get("referencias_producao", {}).values()
+        for item in reference.get("excluidos_da_base_referencia", [])
+    }
+    if excluded:
+        with st.expander(f"{len(excluded)} jogador(es) excluído(s) das referências por posição ausente"):
+            st.json(list(excluded.values()))
     st.write(
         f"Produção: **{cp.get('jogadores_concluidos', 0)} completa(s)** | "
         f"**{cp.get('jogadores_parciais', 0)} parcial(is)** | "
