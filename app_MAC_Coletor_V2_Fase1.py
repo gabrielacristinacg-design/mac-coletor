@@ -899,12 +899,15 @@ def fetch_statz_production(target, squad_cache):
     soup = BeautifulSoup(r.text, "html.parser")
     node = soup.find(attrs={"data-page": True})
     props = json.loads(node["data-page"]).get("props", {}) if node else {}
-    if str(props.get("currentSeason")) != str(season):
-        raise ValueError("temporada_statz_incompativel_com_cartola")
+    # currentSeason pode descrever o resumo padrão, não o ano de cada partida.
+    # O filtro definitivo fica na data ISO individual; nunca aceitar ano anterior.
     if {str(x) for x in props.get("selectedCompetitions", [])} != {"648"}:
         raise ValueError("filtro_brasileirao_nao_confirmado_na_fonte")
     matches, parse_status = parse_statz_season_matches(props, season)
-    parse_status.update({"temporada_confirmada": season, "competicao_id_confirmada": 648,
+    parse_status.update({"temporada_confirmada": season,
+                         "temporada_resumo_fonte": props.get("currentSeason"),
+                         "divergencia_temporada_resumo": str(props.get("currentSeason")) != str(season),
+                         "competicao_id_confirmada": 648,
                          "limite_resposta": props.get("limit"),
                          "cobertura_historico": "competicao_e_temporada_filtradas_antes_da_janela"})
     production = build_production(target, matches, r.url)
