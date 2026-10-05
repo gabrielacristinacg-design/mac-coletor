@@ -247,7 +247,7 @@ def carregar_mercado():
     return status, atletas, club_map
 
 
-def atleta_para_alvo(a, club_map):
+def atleta_para_alvo(a, club_map, season):
     clube = club_map.get(int(a["clube_id"]), {})
     abreviacao = clube.get("abreviacao") or clube.get("abreviacao_nome") or ""
     nome_clube = clube.get("nome") or ""
@@ -262,6 +262,7 @@ def atleta_para_alvo(a, club_map):
 
     return {
         "atleta_id": atleta_id,
+        "temporada": int(season),
         "nome_mercado": apelido,
         "nome_completo": clean(a.get("nome") or ""),
         "clube": nome_clube,
@@ -273,7 +274,7 @@ def atleta_para_alvo(a, club_map):
         "media_mercado": a.get("media_num"),
         "jogos_mercado": a.get("jogos_num"),
         "url_cartola_brasil": (
-            f"{CARTOLA_BRASIL_BASE}/scouts/cartola-fc-2026/"
+            f"{CARTOLA_BRASIL_BASE}/scouts/cartola-fc-{int(season)}/"
             f"atleta/{club_slug}/{atleta_id}/{atleta_slug}"
         ),
     }
@@ -651,6 +652,47 @@ def cell_text(cells, hmap, key):
     return clean(cells[idx].get_text(" ", strip=True))
 
 
+def parse_statz_season_matches(props, season):
+    source_rows = props.get("modules", {}).get("window", {}).get("rows")
+    if not isinstance(source_rows, list):
+        raise ValueError("historico_estruturado_statz_ausente")
+    rows = []
+    seen = set()
+    keys = {"goals": "goals", "assists": "assists", "shots": "shots",
+            "shots_on_target": "sot", "crosses": "crosses", "tackles": "tackles",
+            "interceptions": "interceptions", "aerials_won": "aerials_won", "saves": "saves"}
+    for item in source_rows:
+        if str(item.get("competition", {}).get("id")) != "648":
+            continue
+        date_iso = item.get("date_iso")
+        if not date_iso:
+            raise ValueError("data_completa_ausente_na_partida_statz")
+        if int(date_iso[:4]) != int(season):
+            continue
+        minutes = item.get("minutes")
+        if not isinstance(minutes, (int, float)) or minutes <= 0:
+            continue
+        fixture_id = item.get("fixture_id")
+        if fixture_id is None or fixture_id in seen:
+            raise ValueError("identidade_partida_ausente_ou_duplicada")
+        seen.add(fixture_id)
+        row = {"fixture_id": fixture_id, "date": item.get("date"), "date_iso": date_iso,
+               "temporada": int(season), "competition": "Campeonato Brasileiro",
+               "opponent": item.get("opponent", {}).get("name"), "venue": item.get("venue"),
+               "score": item.get("score"), "result": item.get("result"),
+               "position": item.get("position_full"), "minutes": minutes}
+        stats = item.get("stats", {})
+        for key, field in keys.items():
+            if field in stats:
+                row[key] = stats[field]
+        rows.append(row)
+    rows.sort(key=lambda r: r["date_iso"], reverse=True)
+    return rows[:5], {"status": "ok" if rows else "sem_atuacoes_na_temporada",
+                      "n_atuacoes_temporada_na_janela": len(rows),
+                      "n_partidas_janela_fonte": len(source_rows),
+                      "verificacao_ano": "ano_da_data_iso_de_cada_partida"}
+
+
 def parse_statz_matches(html):
     soup = BeautifulSoup(html, "html.parser")
     table, headers, hmap = find_match_table(soup)
@@ -851,8 +893,20 @@ def fetch_statz_production(target, squad_cache):
             "metricas": {},
         }
 
-    r = get_html(player["url"])
-    matches, parse_status = parse_statz_matches(r.text)
+    season = int(target["temporada"])
+    url = f"{player['url']}?season={season}&competitions=648&limit=20"
+    r = get_html(url)
+    soup = BeautifulSoup(r.text, "html.parser")
+    node = soup.find(attrs={"data-page": True})
+    props = json.loads(node["data-page"]).get("props", {}) if node else {}
+    if str(props.get("currentSeason")) != str(season):
+        raise ValueError("temporada_statz_incompativel_com_cartola")
+    if {str(x) for x in props.get("selectedCompetitions", [])} != {"648"}:
+        raise ValueError("filtro_brasileirao_nao_confirmado_na_fonte")
+    matches, parse_status = parse_statz_season_matches(props, season)
+    parse_status.update({"temporada_confirmada": season, "competicao_id_confirmada": 648,
+                         "limite_resposta": props.get("limit"),
+                         "cobertura_historico": "competicao_e_temporada_filtradas_antes_da_janela"})
     production = build_production(target, matches, r.url)
     production["resolucao_identidade_statz"] = {
         **resolution,
@@ -1299,16 +1353,19 @@ if st.button("CARREGAR JOGADORES DO CARTOLA", type="primary", use_container_widt
     try:
         with st.spinner("Buscando o mercado oficial completo..."):
             status, atletas_api, clubes = carregar_mercado()
+            season = int(status["temporada"])
+            if season < 2000:
+                raise ValueError("temporada_oficial_invalida")
             alvos = []
             for a in atletas_api:
                 pos = POS_MAP.get(int(a.get("posicao_id", 0)))
                 if pos in {"GOL", "LAT", "ZAG", "MEI", "ATA"}:
-                    alvos.append(atleta_para_alvo(a, clubes))
+                    alvos.append(atleta_para_alvo(a, clubes, season))
 
         st.session_state["mercado"] = {
             "rodada_atual": int(status.get("rodada_atual", 0)),
             "status_mercado": int(status.get("status_mercado", 0)),
-            "temporada": int(status.get("temporada", 2026)),
+            "temporada": season,
             "atletas": alvos,
         }
         st.session_state["mac_resultado"] = None
