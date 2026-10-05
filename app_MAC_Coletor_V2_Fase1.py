@@ -216,6 +216,7 @@ def atleta_para_alvo(a, club_map):
     return {
         "atleta_id": atleta_id,
         "nome_mercado": apelido,
+        "nome_completo": clean(a.get("nome") or ""),
         "clube": nome_clube,
         "clube_abreviacao": abreviacao,
         "posicao": posicao,
@@ -943,24 +944,50 @@ def parse_competition_player_base(html, season):
     return rows
 
 
-def build_individual_references(rows, season, source_url):
-    positions = {"GK": "GOL", "LB": "LAT", "RB": "LAT", "LWB": "LAT",
-                 "RWB": "LAT", "CB": "ZAG", "CDM": "MEI", "CM": "MEI",
-                 "CAM": "MEI", "LM": "MEI", "RM": "MEI",
-                 "LW": "ATA", "RW": "ATA", "ST": "ATA", "CF": "ATA"}
+def classify_reference_players(rows, cartola_players):
+    # Nomes exatos normalizados e clube; nunca inferir posição pelo Statz.
+    index = defaultdict(dict)
+    for player in cartola_players:
+        if player.get("posicao") not in PRODUCTION_RULES:
+            continue
+        club = player.get("clube_abreviacao")
+        for name in (player.get("nome_mercado"), player.get("nome_completo")):
+            if name:
+                index[(club, norm(name))][str(player["atleta_id"])] = player
+    classified, excluded = [], []
+    used_ids = set()
+    for row in rows:
+        if not isinstance(row.get("mins"), (int, float)) or row["mins"] <= 0:
+            continue
+        club = None
+        for label in (row.get("team_full"), row.get("team")):
+            club = STATZ_TEAM_TO_ABBR.get(norm(label or ""))
+            if club:
+                break
+        matches = list(index.get((club, norm(row.get("name") or "")), {}).values())
+        if len(matches) == 1 and matches[0]["atleta_id"] not in used_ids:
+            player = matches[0]
+            classified.append(dict(row, posicao_cartola=player["posicao"],
+                                   atleta_id_cartola=player["atleta_id"]))
+            used_ids.add(player["atleta_id"])
+        else:
+            excluded.append({"id": row.get("id"), "jogador": row.get("name"),
+                             "clube": row.get("team_full") or row.get("team"),
+                             "minutos": row["mins"], "posicao_fonte": row.get("pd"),
+                             "motivo": "identidade_cartola_ambigua" if matches else
+                             "sem_correspondencia_segura_no_elenco_cartola"})
+    return classified, excluded
+
+
+def build_individual_references(rows, season, source_url, cartola_players):
     fields = {"saves": "sav", "tackles": "tkl", "crosses": "crs",
               "shots": "sh", "shots_on_target": "sot",
               "interceptions": "int", "aerials_won": "aer",
               "goals": "g", "assists": "a"}
-    eligible = [r for r in rows if isinstance(r.get("mins"), (int, float))
-                and r["mins"] > 0]
-    unclassified = [{"id": r.get("id"), "jogador": r.get("name"),
-                     "minutos": r["mins"], "posicao_fonte": r.get("pd"),
-                     "motivo": "posicao_ausente_ou_nao_reconhecida"}
-                    for r in eligible if positions.get(r.get("pd")) is None]
+    eligible, unclassified = classify_reference_players(rows, cartola_players)
     result = {}
     for position, rules in PRODUCTION_RULES.items():
-        group = [r for r in eligible if positions.get(r.get("pd")) == position]
+        group = [r for r in eligible if r["posicao_cartola"] == position]
         metrics = [(name, fields[field]) for name, field, _ in rules]
         if position != "GOL":
             metrics.append(("gols_assistencias", "ga"))
@@ -982,7 +1009,7 @@ def build_individual_references(rows, season, source_url):
             complete = bool(group) and len(values) == len(group)
             result[f"{position}_{metric}"] = {
                 "competicao": "Campeonato Brasileiro", "temporada": season,
-                "universo": "jogadores com posicao identificada na base da competicao e minutos > 0",
+                "universo": "jogadores identificados no elenco completo do Cartola, agrupados pela posicao oficial do Cartola, com minutos > 0 no Statz",
                 "posicao": position, "metrica": metric,
                 "unidade": "minutos por participacao" if field == "minutes_per_appearance" else "por 90 minutos",
                 "definicao": (
@@ -992,10 +1019,12 @@ def build_individual_references(rows, season, source_url):
                 ),
                 "valor": round(sum(values) / len(values), 4) if complete else None,
                 "n_elementos": len(group), "n_com_metrica": len(values),
-                "jogadores_sem_posicao_na_base": unclassified,
+                "jogadores_sem_vinculo_cartola": unclassified,
                 "excluidos_da_base_referencia": unclassified,
-                "n_excluidos_sem_posicao": len(unclassified),
-                "criterio_exclusao": "excluir automaticamente posição ausente ou não reconhecida; não inferir posição",
+                "n_excluidos_sem_vinculo_cartola": len(unclassified),
+                "n_jogadores_statz_com_minutos": len(eligible) + len(unclassified),
+                "n_jogadores_vinculados_cartola": len(eligible),
+                "criterio_exclusao": "excluir correspondencia ausente ou ambigua no Cartola; nao inferir posicao pelo Statz",
                 "fonte_id": "statz", "fonte_url": source_url,
                 "metodo": (
                     "base_em_lote_media_minutos_por_participacao_individual"
@@ -1003,17 +1032,19 @@ def build_individual_references(rows, season, source_url):
                     "base_completa_em_lote_media_taxas_individuais"
                 ),
                 "criterio_minutos": "> 0; sem filtro arbitrario de titularidade",
-                "mapeamento_posicoes": [k for k, v in positions.items() if v == position],
+                "fonte_posicao": "cartola_api_oficial",
+                "fonte_posicao_url": f"{API_BASE}/atletas/mercado",
+                "jogadores_base": [{"id_statz": r["id"], "atleta_id_cartola": r["atleta_id_cartola"], "jogador": r["name"], "posicao_cartola": position, "posicao_statz": r.get("pd")} for r in group],
                 "status": "ok" if complete else "ausente_fonte_prioritaria",
             }
     return result
 
 
-def fetch_individual_references(season):
+def fetch_individual_references(season, cartola_players):
     url = f"{STATZ_COMPETITION}/stats/players"
     response = get_html(url, timeout=35)
     rows = parse_competition_player_base(response.text, season)
-    return build_individual_references(rows, season, response.url)
+    return build_individual_references(rows, season, response.url, cartola_players)
 
 
 def build_competition_references(collectives, season):
@@ -1137,7 +1168,8 @@ st.caption("Produção L5 + histórico individual + coletivos L5 | Fase operacio
 st.info(
     "Nesta fase V2 já entram Produção individual via Statz e coletivos L5. "
     "As referências coletivas usam os 20 clubes. As individuais usam a base "
-    "da competição por posição e por 90 minutos. Jogadores sem posição "
+    "da competição agrupada pela posição oficial do Cartola, com taxas por 90 "
+    "e minutos por participação. Jogadores sem vínculo seguro com o Cartola "
     "são excluídos das referências e registrados no JSON."
 )
 
@@ -1367,7 +1399,7 @@ if mercado:
         referencia_erro = None
         try:
             status_box.write("Calculando referências individuais da competição em lote...")
-            referencias.update(fetch_individual_references(mercado["temporada"]))
+            referencias.update(fetch_individual_references(mercado["temporada"], atletas))
         except Exception as exc:
             referencia_erro = str(exc)
         pendencias = [
@@ -1485,7 +1517,7 @@ if payload:
         for item in reference.get("excluidos_da_base_referencia", [])
     }
     if excluded:
-        with st.expander(f"{len(excluded)} jogador(es) excluído(s) das referências por posição ausente"):
+        with st.expander(f"{len(excluded)} jogador(es) excluído(s) das referências sem vínculo seguro com o Cartola"):
             st.json(list(excluded.values()))
     st.write(
         f"Produção: **{cp.get('jogadores_concluidos', 0)} completa(s)** | "
