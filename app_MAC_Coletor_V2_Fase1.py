@@ -672,10 +672,86 @@ def fetch_statz_round_index(season):
                 index[key] = {"rodada": number, "data_iso": fixture.get("kickoff_iso"),
                               "clube_mandante": fixture.get("home_team", {}).get("name"),
                               "clube_visitante": fixture.get("away_team", {}).get("name"),
-                              "fonte_rodada_url": response.url}
+                              "fonte_rodada_url": response.url,
+                              "status": fixture.get("status"),
+                              "home_goals": fixture.get("home_team", {}).get("goals"),
+                              "away_goals": fixture.get("away_team", {}).get("goals")}
     if not index:
         raise ValueError("tabela_rodadas_vazia")
     return index
+
+
+def fixture_time(value):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError("horario_partida_sem_fuso")
+    return dt.astimezone(timezone.utc)
+
+
+def validate_round_cut(index, cartola, rodada, now=None):
+    if int(cartola.get("rodada", -1)) != int(rodada):
+        raise ValueError("rodada_cartola_incompativel")
+    official = []
+    clubs = cartola.get("clubes", {})
+    for match in cartola.get("partidas", []):
+        if not match.get("valida", False):
+            continue
+        home = clubs[str(match["clube_casa_id"])]["abreviacao"]
+        away = clubs[str(match["clube_visitante_id"])]["abreviacao"]
+        timestamp = match.get("timestamp")
+        if not isinstance(timestamp, (int, float)):
+            raise ValueError("horario_oficial_cartola_ausente")
+        official.append((home, away, int(timestamp)))
+    source = []
+    for fixture in index.values():
+        if fixture["rodada"] == int(rodada):
+            source.append((STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_mandante"])),
+                           STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_visitante"])),
+                           int(fixture_time(fixture["data_iso"]).timestamp())))
+    if not official or len(set(official)) != len(official) or sorted(official) != sorted(source):
+        raise ValueError("confrontos_ou_horarios_cartola_statz_divergentes")
+    now = now or datetime.now(timezone.utc)
+    cutoff = min(now, datetime.fromtimestamp(min(x[2] for x in official), timezone.utc))
+    # As referências individuais são acumulados atuais, sem filtro histórico na fonte.
+    # Bloquear, em vez de apresentar médias posteriores como se fossem históricas.
+    if any(f["status"] == "finished" and fixture_time(f["data_iso"]) >= cutoff
+           for f in index.values()):
+        raise ValueError("referencias_acumuladas_contem_partidas_posteriores_ao_corte")
+    return {"status": "confirmado", "rodada_cartola": int(rodada),
+            "confrontos_confirmados": len(official), "criterio": "mandante_visitante_horario_utc",
+            "data_corte_exclusiva": cutoff.isoformat(),
+            "referencias": "acumulados_atuais_sem_partidas_concluidas_apos_corte"}
+
+
+def cut_season_matches(matches, index, cutoff):
+    kept = []
+    for match in matches:
+        fixture = index.get(str(match["fixture_id"]))
+        if fixture is None:
+            raise ValueError("partida_sem_identidade_no_calendario_para_corte")
+        if fixture["status"] != "finished":
+            continue
+        if fixture_time(fixture["data_iso"]) < fixture_time(cutoff):
+            kept.append(match)
+    kept.sort(key=lambda m: fixture_time(index[str(m["fixture_id"])]["data_iso"]), reverse=True)
+    return kept[:5]
+
+
+def cut_collective_fixtures(index, cutoff):
+    rows = []
+    for fixture_id, f in index.items():
+        dt = fixture_time(f["data_iso"])
+        if f["status"] != "finished" or dt >= fixture_time(cutoff):
+            continue
+        if not isinstance(f["home_goals"], int) or not isinstance(f["away_goals"], int):
+            raise ValueError("placar_coletivo_ausente")
+        rows.append({"fixture_id": fixture_id, "rodada": f["rodada"],
+                     "date": dt.isoformat(), "date_obj": dt,
+                     "home_abbr": STATZ_TEAM_TO_ABBR.get(norm(f["clube_mandante"])),
+                     "away_abbr": STATZ_TEAM_TO_ABBR.get(norm(f["clube_visitante"])),
+                     "home_goals": f["home_goals"], "away_goals": f["away_goals"]})
+    rows.sort(key=lambda m: m["date_obj"])
+    return rows
 
 
 def parse_statz_season_matches(props, season):
@@ -713,7 +789,7 @@ def parse_statz_season_matches(props, season):
                 row[key] = stats[field]
         rows.append(row)
     rows.sort(key=lambda r: r["date_iso"], reverse=True)
-    return rows[:5], {"status": "ok" if rows else "sem_atuacoes_na_temporada",
+    return rows, {"status": "ok" if rows else "sem_atuacoes_na_temporada",
                       "n_atuacoes_temporada_na_janela": len(rows),
                       "n_partidas_janela_fonte": len(source_rows),
                       "verificacao_ano": "ano_da_data_iso_de_cada_partida"}
@@ -761,7 +837,7 @@ def parse_statz_matches(html):
         rows.append(row)
 
     # Statz apresenta as partidas da mais recente para a mais antiga.
-    return rows[:5], {
+    return rows, {
         "status": "ok" if rows else "sem_atuacoes_suficientes",
         "cabecalhos": headers,
         "n_atuacoes_brasileirao_visiveis": len(rows),
@@ -937,6 +1013,11 @@ def fetch_statz_production(target, squad_cache):
                          "limite_resposta": props.get("limit"),
                          "cobertura_historico": "competicao_e_temporada_filtradas_antes_da_janela"})
     round_index = squad_cache.get("_rodadas_statz", {})
+    n_before_cut = len(matches)
+    matches = cut_season_matches(matches, round_index, squad_cache["_corte"]["data_corte_exclusiva"])
+    if len(matches) < 5 and n_before_cut >= 20:
+        raise ValueError("janela_da_fonte_insuficiente_para_confirmar_amostra_apos_corte")
+    parse_status["corte_temporal"] = squad_cache["_corte"]
     for match in matches:
         fixture = round_index.get(str(match["fixture_id"]))
         match["rodada"] = fixture.get("rodada") if fixture else None
@@ -1536,9 +1617,12 @@ if mercado:
         rodada_vinculo_erro = None
         try:
             squad_cache["_rodadas_statz"] = fetch_statz_round_index(mercado["temporada"])
+            squad_cache["_corte"] = validate_round_cut(
+                squad_cache["_rodadas_statz"], get_json(f"{API_BASE}/partidas/{int(rodada)}"), int(rodada))
         except Exception as exc:
             rodada_vinculo_erro = str(exc)
-            squad_cache["_rodadas_statz"] = {}
+            st.error(f"Coleta interrompida: não foi possível validar o corte e as referências. {exc}")
+            st.stop()
 
         # Coleta de jogadores em paralelo; o cache de elenco é compartilhado
         # apenas como otimização. Em caso de corrida, a pior consequência é uma
@@ -1583,7 +1667,8 @@ if mercado:
         coletivo_erro = None
         try:
             status_box.write("Fechando coletivos L5 dos clubes...")
-            fixtures, fixtures_url = parse_statz_fixtures()
+            fixtures = cut_collective_fixtures(squad_cache["_rodadas_statz"], squad_cache["_corte"]["data_corte_exclusiva"])
+            fixtures_url = f"{STATZ_FIXTURES}?season={int(mercado["temporada"])}"
             selected_abbrs = set(STATZ_CLUBE_SLUG)
             coletivos = build_club_collectives(
                 fixtures,
@@ -1680,8 +1765,9 @@ if mercado:
                 "erro_vinculo_rodadas": rodada_vinculo_erro,
                 "atuacoes_sem_rodada": sum(m.get("rodada") is None for player in resultados
                                            for m in player.get("producao", {}).get("amostra", {}).get("partidas", [])),
-                "corte_historico_por_rodada": "ainda_nao_aplicado; coleta representa dados atuais",
-                "equivalencia_rodada_cartola": "nao_validada; rodada das atuacoes vem do Statz",
+                "corte_temporal": squad_cache["_corte"],
+                "corte_historico_por_rodada": "data_utc_exclusiva_antes_da_primeira_partida_da_rodada; limitado_a_referencias_atuais",
+                "equivalencia_rodada_cartola": "confrontos_e_horarios_da_rodada_alvo_confirmados; demais_rodadas_identificadas_pelo_statz",
                 "protocolo_fallback": "pendente_fase_2",
                 "proxima_acao": (
                     "implementar fonte alternativa finita; revisar referencias ausentes, se houver"
