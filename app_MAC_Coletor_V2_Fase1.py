@@ -944,47 +944,75 @@ def parse_competition_player_base(html, season):
     return rows
 
 
-def classify_reference_players(rows, cartola_players):
-    # Nomes exatos normalizados e clube; nunca inferir posição pelo Statz.
-    index = defaultdict(dict)
-    for player in cartola_players:
-        if player.get("posicao") not in PRODUCTION_RULES:
-            continue
-        club = player.get("clube_abreviacao")
-        for name in (player.get("nome_mercado"), player.get("nome_completo")):
-            if name:
-                index[(club, norm(name))][str(player["atleta_id"])] = player
+def classify_reference_players(rows, cartola_players, collected_players=None):
+    players = {str(p["atleta_id"]): p for p in cartola_players
+               if p.get("posicao") in PRODUCTION_RULES}
+    clubs = defaultdict(list)
+    for player in players.values():
+        clubs[player.get("clube_abreviacao")].append(player)
+    confirmed = defaultdict(set)
+    for collected in collected_players or []:
+        resolution = collected.get("producao", {}).get("resolucao_identidade_statz", {})
+        url = resolution.get("url", "")
+        match = re.search(r"/player/[^/]+/(\d+)(?:[/?#]|$)", url)
+        player_id = str(collected.get("atleta_id"))
+        if resolution.get("status") == "ok" and match and player_id in players:
+            confirmed[match.group(1)].add(player_id)
+    eligible = [r for r in rows if isinstance(r.get("mins"), (int, float)) and r["mins"] > 0]
+    candidates = {}
+    methods = {}
+    for row in eligible:
+        club = next((STATZ_TEAM_TO_ABBR[norm(label)] for label in
+                     (row.get("team_full") or "", row.get("team") or "")
+                     if norm(label) in STATZ_TEAM_TO_ABBR), None)
+        pool = clubs.get(club, [])
+        name = norm(row.get("name") or "")
+        linked = {pid for pid in confirmed.get(str(row.get("id")), set())
+                  if players[pid].get("clube_abreviacao") == club}
+        method = "vinculo_confirmado_na_coleta"
+        if not linked:
+            linked = {str(p["atleta_id"]) for p in pool if name and name in
+                      {norm(p.get("nome_mercado")), norm(p.get("nome_completo"))}}
+            method = "nome_exato_e_clube"
+        if not linked:
+            # Contenção de palavras inteiras; nada de similaridade aproximada.
+            linked = {str(p["atleta_id"]) for p in pool
+                      for alias in (norm(p.get("nome_mercado")), norm(p.get("nome_completo")))
+                      if name and alias and min(len(name), len(alias)) >= 4 and
+                      (f" {name} " in f" {alias} " or f" {alias} " in f" {name} ")}
+            method = "nome_contido_unico_e_clube"
+        candidates[row["id"]] = linked
+        methods[row["id"]] = method
+    # Reciprocidade evita vincular dois nomes/linhas ao mesmo atleta.
+    reverse = defaultdict(set)
+    for statz_id, linked in candidates.items():
+        for player_id in linked:
+            reverse[player_id].add(statz_id)
     classified, excluded = [], []
-    used_ids = set()
-    for row in rows:
-        if not isinstance(row.get("mins"), (int, float)) or row["mins"] <= 0:
-            continue
-        club = None
-        for label in (row.get("team_full"), row.get("team")):
-            club = STATZ_TEAM_TO_ABBR.get(norm(label or ""))
-            if club:
-                break
-        matches = list(index.get((club, norm(row.get("name") or "")), {}).values())
-        if len(matches) == 1 and matches[0]["atleta_id"] not in used_ids:
-            player = matches[0]
+    for row in eligible:
+        linked = candidates[row["id"]]
+        player_id = next(iter(linked)) if len(linked) == 1 else None
+        if player_id and len(reverse[player_id]) == 1:
+            player = players[player_id]
             classified.append(dict(row, posicao_cartola=player["posicao"],
-                                   atleta_id_cartola=player["atleta_id"]))
-            used_ids.add(player["atleta_id"])
+                                   atleta_id_cartola=player_id,
+                                   metodo_vinculo_cartola=methods[row["id"]]))
         else:
             excluded.append({"id": row.get("id"), "jogador": row.get("name"),
                              "clube": row.get("team_full") or row.get("team"),
                              "minutos": row["mins"], "posicao_fonte": row.get("pd"),
-                             "motivo": "identidade_cartola_ambigua" if matches else
+                             "candidatos_cartola": sorted(linked),
+                             "motivo": "identidade_cartola_ambigua" if linked else
                              "sem_correspondencia_segura_no_elenco_cartola"})
     return classified, excluded
 
 
-def build_individual_references(rows, season, source_url, cartola_players):
+def build_individual_references(rows, season, source_url, cartola_players, collected_players=None):
     fields = {"saves": "sav", "tackles": "tkl", "crosses": "crs",
               "shots": "sh", "shots_on_target": "sot",
               "interceptions": "int", "aerials_won": "aer",
               "goals": "g", "assists": "a"}
-    eligible, unclassified = classify_reference_players(rows, cartola_players)
+    eligible, unclassified = classify_reference_players(rows, cartola_players, collected_players)
     result = {}
     for position, rules in PRODUCTION_RULES.items():
         group = [r for r in eligible if r["posicao_cartola"] == position]
@@ -1034,17 +1062,17 @@ def build_individual_references(rows, season, source_url, cartola_players):
                 "criterio_minutos": "> 0; sem filtro arbitrario de titularidade",
                 "fonte_posicao": "cartola_api_oficial",
                 "fonte_posicao_url": f"{API_BASE}/atletas/mercado",
-                "jogadores_base": [{"id_statz": r["id"], "atleta_id_cartola": r["atleta_id_cartola"], "jogador": r["name"], "posicao_cartola": position, "posicao_statz": r.get("pd")} for r in group],
+                "jogadores_base": [{"id_statz": r["id"], "atleta_id_cartola": r["atleta_id_cartola"], "jogador": r["name"], "posicao_cartola": position, "posicao_statz": r.get("pd"), "metodo_vinculo": r["metodo_vinculo_cartola"]} for r in group],
                 "status": "ok" if complete else "ausente_fonte_prioritaria",
             }
     return result
 
 
-def fetch_individual_references(season, cartola_players):
+def fetch_individual_references(season, cartola_players, collected_players=None):
     url = f"{STATZ_COMPETITION}/stats/players"
     response = get_html(url, timeout=35)
     rows = parse_competition_player_base(response.text, season)
-    return build_individual_references(rows, season, response.url, cartola_players)
+    return build_individual_references(rows, season, response.url, cartola_players, collected_players)
 
 
 def build_competition_references(collectives, season):
@@ -1399,7 +1427,7 @@ if mercado:
         referencia_erro = None
         try:
             status_box.write("Calculando referências individuais da competição em lote...")
-            referencias.update(fetch_individual_references(mercado["temporada"], atletas))
+            referencias.update(fetch_individual_references(mercado["temporada"], atletas, resultados))
         except Exception as exc:
             referencia_erro = str(exc)
         pendencias = [
