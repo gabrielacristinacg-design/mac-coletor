@@ -5,7 +5,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote, unquote
 
 import requests
 import streamlit as st
@@ -186,14 +186,40 @@ def get_html(url, timeout=25):
 
 def fetch_cartola_page(target, timeout):
     url = target["url_cartola_brasil"]
-    try:
-        return get_html(url, timeout=timeout)
-    except requests.TooManyRedirects:
-        # Recomeçar pelo ID, sem carregar um apelido/slug possivelmente antigo.
-        # Um único endereço alternativo, sem busca ilimitada.
-        canonical = url.rsplit("/", 1)[0] + "/"
-        response = get_html(canonical, timeout=timeout)
-        return response
+    visited = set()
+    for _ in range(6):
+        if url in visited:
+            raise ValueError("historico_cartola_redirecionamento_circular; nao substituir ausencia por zero")
+        visited.add(url)
+        for attempt in range(2):
+            try:
+                response = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=False)
+                break
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt:
+                    raise
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            response.raise_for_status()
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            raise ValueError("redirecionamento_sem_destino")
+        destination = urljoin(url, location)
+        # Corrigir mojibake no caminho de redirecionamento, inclusive dupla codificação.
+        parsed = urlparse(destination)
+        path = unquote(parsed.path)
+        for _ in range(3):
+            try:
+                repaired = path.encode("latin1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                break
+            if repaired == path:
+                break
+            path = repaired
+        if parsed.netloc != urlparse(target["url_cartola_brasil"]).netloc:
+            raise ValueError("redirecionamento_para_host_nao_esperado")
+        url = parsed._replace(path=quote(path, safe="/"), fragment="").geturl()
+    raise ValueError("limite_finito_de_redirecionamentos_do_historico")
 
 
 def get_json(url, timeout=25):
@@ -494,10 +520,9 @@ def fetch_statz_squad(sigla, cache):
                 continue
 
             full_url = urljoin(STATZ_BASE, href)
-            key = (norm(name), full_url)
+            key = full_url
             if key in seen:
                 continue
-            seen.add(key)
 
             position = None
             tr = a.find_parent("tr")
@@ -506,6 +531,9 @@ def fetch_statz_squad(sigla, cache):
                 if len(cells) >= 2:
                     position = cells[1]
 
+            if position not in {"GK", "LB", "RB", "LWB", "RWB", "CB", "CDM", "CM", "CAM", "LM", "RM", "LW", "RW", "ST", "CF"}:
+                continue
+            seen.add(key)
             players.append({
                 "name": name,
                 "name_norm": norm(name),
@@ -534,19 +562,29 @@ def resolve_statz_player(target, cache):
 
     aliases = {norm(target.get("nome_mercado")), norm(target.get("nome_completo"))} - {""}
     q = norm(target["nome_mercado"])
+    full_tokens = set(norm(target.get("nome_completo")).split()) - {"da", "de", "do", "dos", "das"}
+    full_matches = [p for p in players if len(set(p["name_norm"].split())) >= 2
+                    and set(p["name_norm"].split()).issubset(full_tokens)]
+    if len(full_matches) == 1:
+        return full_matches[0], {"status": "ok", "metodo": "nome_completo_sobrenomes_compativeis"}
     exact = [p for p in players if p["name_norm"] in aliases]
-    if len(exact) == 1:
-        return exact[0], {"status": "ok", "metodo": "nome_exato_ou_completo"}
-    if len(exact) > 1:
-        return None, {"status": "inconsistente", "motivo": "nomes_exatos_ambiguos", "fonte_url": squad.get("url")}
     contains = [p for p in players if any(
         min(len(alias), len(p["name_norm"])) >= 4 and
         (f" {alias} " in f" {p['name_norm']} " or f" {p['name_norm']} " in f" {alias} ")
         for alias in aliases)]
-    if len(contains) == 1:
-        return contains[0], {"status": "ok", "metodo": "nome_contido_ou_completo_unico"}
-    if len(contains) > 1:
-        return None, {"status": "inconsistente", "motivo": "nomes_contidos_ambiguos", "fonte_url": squad.get("url")}
+    candidates = full_matches or exact or contains
+    if len(candidates) == 1:
+        return candidates[0], {"status": "ok", "metodo": "nome_unico_no_elenco"}
+    if len(candidates) > 1:
+        position_map = {"GK": "GOL", "LB": "LAT", "RB": "LAT", "LWB": "LAT", "RWB": "LAT",
+                        "CB": "ZAG", "CDM": "MEI", "CM": "MEI", "CAM": "MEI", "LM": "MEI", "RM": "MEI",
+                        "LW": "ATA", "RW": "ATA", "ST": "ATA", "CF": "ATA"}
+        compatible = [p for p in candidates if position_map.get(p.get("position")) == target["posicao"]]
+        if len(compatible) == 1:
+            return compatible[0], {"status": "ok", "metodo": "nome_clube_e_posicao_desambiguados"}
+        return None, {"status": "inconsistente", "motivo": "nomes_ambiguos_apos_conferencia_posicao",
+                      "candidatos": [{"nome": p["name"], "url": p["url"], "posicao_statz": p.get("position")} for p in candidates],
+                      "fonte_url": squad.get("url")}
 
     q_tokens = {x for x in q.split() if len(x) >= 3}
     token_matches = []
