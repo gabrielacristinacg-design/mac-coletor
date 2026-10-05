@@ -921,6 +921,82 @@ def build_club_collectives(fixtures, selected_abbrs, source_url):
 # REFERÊNCIAS DA COMPETIÇÃO
 # -----------------------------
 
+def parse_competition_player_base(html, season):
+    soup = BeautifulSoup(html, "html.parser")
+    node = soup.find(attrs={"data-page": True})
+    if node is None:
+        raise ValueError("base_estruturada_nao_encontrada")
+    props = json.loads(node["data-page"]).get("props", {})
+    if props.get("competition", {}).get("slug") != "campeonato-brasileiro":
+        raise ValueError("competicao_incompativel")
+    if str(props.get("hero", {}).get("season")) != str(season):
+        raise ValueError("temporada_incompativel")
+    if props.get("venue") != "overall" or props.get("initialMode") != "total":
+        raise ValueError("base_nao_representa_totais_gerais")
+    rows = props.get("playerRows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("base_jogadores_vazia")
+    if len({r.get("id") for r in rows}) != len(rows):
+        raise ValueError("jogadores_duplicados_na_base")
+    if len({r.get("team_id") for r in rows}) != 20:
+        raise ValueError("base_nao_cobre_20_clubes")
+    return rows
+
+
+def build_individual_references(rows, season, source_url):
+    positions = {"GK": "GOL", "LB": "LAT", "RB": "LAT", "LWB": "LAT",
+                 "RWB": "LAT", "CB": "ZAG", "CDM": "MEI", "CM": "MEI",
+                 "CAM": "MEI", "LM": "MEI", "RM": "MEI",
+                 "LW": "ATA", "RW": "ATA", "ST": "ATA", "CF": "ATA"}
+    fields = {"saves": "sav", "tackles": "tkl", "crosses": "crs",
+              "shots": "sh", "shots_on_target": "sot",
+              "interceptions": "int", "aerials_won": "aer",
+              "goals": "g", "assists": "a"}
+    eligible = [r for r in rows if isinstance(r.get("mins"), (int, float))
+                and r["mins"] > 0]
+    unclassified = [{"id": r.get("id"), "jogador": r.get("name"),
+                     "minutos": r["mins"]}
+                    for r in eligible if positions.get(r.get("pd")) is None]
+    result = {}
+    for position, rules in PRODUCTION_RULES.items():
+        group = [r for r in eligible if positions.get(r.get("pd")) == position]
+        metrics = [(name, fields[field]) for name, field, _ in rules]
+        if position != "GOL":
+            metrics.append(("gols_assistencias", "ga"))
+        for metric, field in metrics:
+            values = []
+            for row in group:
+                value = (row.get("g") + row.get("a")
+                         if field == "ga" and isinstance(row.get("g"), (int, float))
+                         and isinstance(row.get("a"), (int, float))
+                         else row.get(field))
+                if isinstance(value, (int, float)) and value >= 0:
+                    values.append(value * 90 / row["mins"])
+            complete = bool(group) and len(values) == len(group)
+            result[f"{position}_{metric}"] = {
+                "competicao": "Campeonato Brasileiro", "temporada": season,
+                "universo": "jogadores com posicao identificada na base da competicao e minutos > 0",
+                "posicao": position, "metrica": metric, "unidade": "por 90 minutos",
+                "definicao": "media aritmetica das taxas individuais por 90 da temporada; producao L5 deve ser comparada por 90",
+                "valor": round(sum(values) / len(values), 4) if complete else None,
+                "n_elementos": len(group), "n_com_metrica": len(values),
+                "jogadores_sem_posicao_na_base": unclassified,
+                "fonte_id": "statz", "fonte_url": source_url,
+                "metodo": "base_completa_em_lote_media_taxas_individuais",
+                "criterio_minutos": "> 0; sem filtro arbitrario de titularidade",
+                "mapeamento_posicoes": [k for k, v in positions.items() if v == position],
+                "status": ("parcial" if unclassified else "ok") if complete else "ausente_fonte_prioritaria",
+            }
+    return result
+
+
+def fetch_individual_references(season):
+    url = f"{STATZ_COMPETITION}/stats/players"
+    response = get_html(url, timeout=35)
+    rows = parse_competition_player_base(response.text, season)
+    return build_individual_references(rows, season, response.url)
+
+
 def build_competition_references(collectives, season):
     universe = set(STATZ_CLUBE_SLUG)
     valid = (
@@ -1031,8 +1107,8 @@ st.caption("Produção L5 + histórico individual + coletivos L5 | Fase operacio
 
 st.info(
     "Nesta fase V2 já entram Produção individual via Statz e coletivos L5. "
-    "As referências coletivas usam os 20 clubes. Referências individuais "
-    "sem uma base completa ficam ausentes, com motivo explícito."
+    "As referências coletivas usam os 20 clubes. As individuais usam a base "
+    "da competição por posição e por 90 minutos; cobertura incompleta é sinalizada."
 )
 
 if "mercado" not in st.session_state:
@@ -1258,6 +1334,12 @@ if mercado:
             })
 
         referencias = build_competition_references(coletivos, mercado["temporada"])
+        referencia_erro = None
+        try:
+            status_box.write("Calculando referências individuais da competição em lote...")
+            referencias.update(fetch_individual_references(mercado["temporada"]))
+        except Exception as exc:
+            referencia_erro = str(exc)
         pendencias = [
             {"atleta_id": p["atleta_id"], "jogador": p["jogador"],
              "status": p.get("producao", {}).get("status")}
@@ -1326,12 +1408,13 @@ if mercado:
                 ),
                 "referencias_concluidas": sum(r["status"] == "ok" for r in referencias.values()),
                 "referencias_pendentes": sum(r["status"] != "ok" for r in referencias.values()),
+                "referencias_parciais": sum(r["status"] == "parcial" for r in referencias.values()),
                 "amostras_reduzidas": amostras_reduzidas,
                 "descoberta_clubes_statz": descoberta_clubes,
+                "erro_referencias_individuais": referencia_erro,
                 "protocolo_fallback": "pendente_fase_2",
                 "proxima_acao": (
-                    "implementar fonte alternativa finita e obter base completa "
-                    "para referencias individuais por posicao"
+                    "implementar fonte alternativa finita; revisar referencias ausentes, se houver"
                 ),
             },
             "total_mercado": len(atletas),
@@ -1361,7 +1444,8 @@ if payload:
         st.warning(
             f"Coleta parcial: {payload.get('total_pendencias_producao', 0)} "
             f"pendência(s) de produção e {cp.get('referencias_pendentes', 0)} "
-            "referência(s) ausente(s). Erros técnicos e dados ausentes são contados separadamente."
+            "referência(s) pendente(s), incluindo cobertura parcial. "
+            "Erros técnicos e dados ausentes são contados separadamente."
         )
     if cp.get("amostras_reduzidas", 0):
         st.info(f"{cp['amostras_reduzidas']} jogador(es) com menos de 5 atuações disponíveis.")
