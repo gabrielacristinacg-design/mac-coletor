@@ -1422,7 +1422,160 @@ def collect_one_player(target, rodada, janela, squad_cache):
             "metricas": {},
         }
 
+    try:
+        base["identificacao_lado_lateral"] = resolve_lateral_side(target, squad_cache)
+    except Exception as exc:
+        base["identificacao_lado_lateral"] = {"status": "pendente", "lado": None, "erro": str(exc)}
+    base["lado_lateral"] = base["identificacao_lado_lateral"].get("lado")
+
     return base
+
+
+# Sites oficiais: usados somente como alternativa para o lado dos laterais.
+OFFICIAL_CLUB_SITES = {
+    "SAN": "https://www.santosfc.com.br/masculino/",
+    "PAL": "https://www.palmeiras.com.br/elenco/",
+    "MIR": "https://mirassolfc.com.br/blogs/elenco",
+    "CHA": "https://chapecoense.com/elenco/",
+    "FLA": "https://www.flamengo.com.br/", "FLU": "https://www.fluminense.com.br/site/",
+    "VAS": "https://vasco.com.br/", "BOT": "https://www.botafogo.com.br/",
+    "COR": "https://www.corinthians.com.br/", "SAO": "https://www.saopaulofc.net/",
+    "RBB": "https://www.redbullbragantino.com/br-pt", "CRU": "https://www.cruzeiro.com.br/",
+    "CAM": "https://atletico.com.br/", "GRE": "https://www.gremio.net/",
+    "INT": "https://internacional.com.br/", "CAP": "https://www.athletico.com.br/",
+    "CFC": "https://www.coritiba.com.br/", "BAH": "https://www.esporteclubebahia.com.br/",
+    "VIT": "https://ecvitoria.com.br/", "REM": "https://www.clubedoremo.com.br/",
+}
+
+
+def explicit_lateral_side(text):
+    value = norm(text).replace("-", " ")
+    right = bool(re.search(r"\b(?:lateral direito|ala direito|right back|right wing back)\b", value))
+    left = bool(re.search(r"\b(?:lateral esquerdo|ala esquerdo|left back|left wing back)\b", value))
+    return "LD" if right and not left else "LE" if left and not right else None
+
+
+def official_same_host(url, seed):
+    return (urlparse(url).scheme in {"http", "https"}
+            and (urlparse(url).hostname or "").removeprefix("www.")
+            == (urlparse(seed).hostname or "").removeprefix("www."))
+
+
+def official_name_matches(text, target):
+    name = re.sub(r"^\d+\s*", "", norm(text)).strip()
+    return any(name == norm(target.get(k, "")) and len(name) >= 4
+               for k in ("nome_mercado", "nome_completo"))
+
+
+def parse_official_side(html, target):
+    soup = BeautifulSoup(html, "html.parser")
+    findings = []
+    # Somente cartões/perfis com nome exato e definição explícita ligada ao atleta.
+    # Não inferir pelo pé dominante ou pela ordem de jogadores na escalação.
+    for label in soup.find_all(["h1", "h2", "h3", "h4", "a", "strong"]):
+        if not official_name_matches(label.get_text(" ", strip=True), target):
+            continue
+        current = label
+        for _ in range(5):
+            if current is None or current.name in {"body", "html"}:
+                break
+            text = clean(current.get_text(" ", strip=True))
+            if len(text) > 450:
+                break
+            side = explicit_lateral_side(text)
+            # Outro título com nome de jogador não pode emprestar sua posição.
+            named_heads = [h for h in current.find_all(["h1", "h2", "h3", "h4"])
+                           if not explicit_lateral_side(h.get_text(" ", strip=True))
+                           and norm(h.get_text(" ", strip=True)) not in {"laterais", "posicao", "dados"}]
+            if side and all(official_name_matches(h.get_text(" ", strip=True), target)
+                            for h in named_heads):
+                findings.append((side, text))
+                break
+            current = current.parent
+    sides = {x[0] for x in findings}
+    return findings[0] if len(sides) == 1 else (None, None)
+
+
+def fetch_official_side(target, cache):
+    seed = OFFICIAL_CLUB_SITES.get(target["clube_abreviacao"])
+    audit = []
+    if not seed:
+        return {"status": "pendente", "lado": None, "motivo": "site_oficial_nao_configurado", "tentativas": audit}
+    key = "_site_oficial_" + target["clube_abreviacao"]
+    if key not in cache:
+        pages = []
+        try:
+            r = get_html(seed, timeout=15)
+            if not official_same_host(r.url, seed):
+                raise ValueError("redirecionamento_fora_do_site_oficial")
+            pages.append((r.url, r.text))
+            soup = BeautifulSoup(r.text, "html.parser")
+            links = []
+            for link in soup.find_all("a", href=True):
+                u = urljoin(r.url, link["href"])
+                desc = norm(link.get_text(" ", strip=True) + " " + urlparse(u).path)
+                if (official_same_host(u, seed) and u not in links and u != r.url
+                    and any(x in desc for x in ("elenco", "squad", "equipe principal", "futebol profissional", "masculino"))
+                    and not any(x in desc for x in ("femin", "base", "sub-", "noticia", "news", "category"))):
+                    links.append(u)
+            for u in links[:2]:
+                try:
+                    r2 = get_html(u, timeout=15)
+                    if official_same_host(r2.url, seed):
+                        pages.append((r2.url, r2.text))
+                except Exception as exc:
+                    audit.append({"url": u, "erro": str(exc)})
+            cache[key] = {"pages": pages, "tentativas": audit}
+        except Exception as exc:
+            cache[key] = {"pages": pages, "tentativas": [{"url": seed, "erro": str(exc)}]}
+    bundle = cache[key]
+    audit = list(bundle["tentativas"])
+    profiles = []
+    for url, html in bundle["pages"]:
+        side, evidence = parse_official_side(html, target)
+        audit.append({"url": url, "status": "confirmado" if side else "lado_nao_encontrado"})
+        if side:
+            return {"status": "confirmado", "lado": side, "fonte": "site_oficial_clube",
+                    "fonte_url": url, "evidencia": evidence, "tentativas": audit}
+        for link in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+            u = urljoin(url, link["href"])
+            if (official_name_matches(link.get_text(" ", strip=True), target)
+                and official_same_host(u, seed) and u not in profiles
+                and any(x in norm(urlparse(u).path) for x in ("atleta", "jogador", "player", "elenco", "equipe"))
+                and not any(x in norm(urlparse(u).path) for x in ("noticia", "news", "base", "femin", "sub-"))):
+                profiles.append(u)
+    for url in profiles[:2]:
+        try:
+            r = get_html(url, timeout=15)
+            if not official_same_host(r.url, seed):
+                raise ValueError("redirecionamento_fora_do_site_oficial")
+            side, evidence = parse_official_side(r.text, target)
+            audit.append({"url": r.url, "status": "confirmado" if side else "lado_nao_encontrado"})
+            if side:
+                return {"status": "confirmado", "lado": side, "fonte": "site_oficial_clube",
+                        "fonte_url": r.url, "evidencia": evidence, "tentativas": audit}
+        except Exception as exc:
+            audit.append({"url": url, "erro": str(exc)})
+    return {"status": "pendente", "lado": None, "motivo": "lado_nao_confirmado_no_site_oficial", "tentativas": audit}
+
+
+def resolve_lateral_side(target, cache):
+    if target["posicao"] != "LAT":
+        return {"status": "nao_aplicavel", "lado": None}
+    try:
+        player, resolution = resolve_statz_player(target, cache)
+    except Exception as exc:
+        player, resolution = None, {"status": "erro", "erro": str(exc)}
+    position = player.get("position") if player else None
+    side = {"RB": "LD", "RWB": "LD", "LB": "LE", "LWB": "LE"}.get(position)
+    statz_audit = {"fonte": "statz", "posicao": position, "identidade": resolution}
+    if side:
+        return {"status": "confirmado", "lado": side, "fonte": "statz",
+                "fonte_url": fetch_statz_squad(target["clube_abreviacao"], cache)["url"],
+                "evidencia": position, "tentativas": [statz_audit]}
+    result = fetch_official_side(target, cache)
+    result["tentativas"] = [statz_audit] + result.get("tentativas", [])
+    return result
 
 
 def label_player(p):
@@ -1768,7 +1921,10 @@ if mercado:
                 "corte_temporal": squad_cache["_corte"],
                 "corte_historico_por_rodada": "data_utc_exclusiva_antes_da_primeira_partida_da_rodada; limitado_a_referencias_atuais",
                 "equivalencia_rodada_cartola": "confrontos_e_horarios_da_rodada_alvo_confirmados; demais_rodadas_identificadas_pelo_statz",
-                "protocolo_fallback": "pendente_fase_2",
+                "laterais_lado_confirmado": sum(p["posicao"] == "LAT" and p.get("lado_lateral") in {"LD", "LE"} for p in resultados),
+                "laterais_lado_pendente": sum(p["posicao"] == "LAT" and not p.get("lado_lateral") for p in resultados),
+                "fallback_lado_lateral": "statz_depois_site_oficial_clube; sem_inferencia",
+                "protocolo_fallback": "pendente_fase_2_para_metricas; lado_lateral_implementado",
                 "proxima_acao": (
                     "implementar fonte alternativa finita; revisar referencias ausentes, se houver"
                 ),
@@ -1803,6 +1959,8 @@ if payload:
             "referência(s) pendente(s), incluindo cobertura parcial. "
             "Erros técnicos e dados ausentes são contados separadamente."
         )
+    if cp.get("laterais_lado_pendente", 0):
+        st.warning(f"{cp['laterais_lado_pendente']} lateral(is) sem LD/LE confirmado. Cálculos que dependem do lado ficam pendentes.")
     if cp.get("amostras_reduzidas", 0):
         st.info(f"{cp['amostras_reduzidas']} jogador(es) com menos de 5 atuações disponíveis.")
     excluded = {
