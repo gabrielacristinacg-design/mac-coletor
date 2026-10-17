@@ -692,12 +692,18 @@ def validate_round_cut(index, cartola, rodada, now=None):
     if int(cartola.get("rodada", -1)) != int(rodada):
         raise ValueError("rodada_cartola_incompativel")
     official = []
+    invalid_pairs = set()
     clubs = cartola.get("clubes", {})
     for match in cartola.get("partidas", []):
-        if not match.get("valida", False):
-            continue
         home = clubs[str(match["clube_casa_id"])]["abreviacao"]
         away = clubs[str(match["clube_visitante_id"])]["abreviacao"]
+        # O calendário do campeonato inclui jogos que não valem no fantasy.
+        # Excluir da comparação somente os explicitamente marcados pela API.
+        if match.get("valida") is False:
+            invalid_pairs.add((home, away))
+            continue
+        if match.get("valida") is not True:
+            raise ValueError(f"validade_cartola_nao_informada: {home} x {away}")
         timestamp = match.get("timestamp")
         if not isinstance(timestamp, (int, float)):
             raise ValueError("horario_oficial_cartola_ausente")
@@ -705,11 +711,23 @@ def validate_round_cut(index, cartola, rodada, now=None):
     source = []
     for fixture in index.values():
         if fixture["rodada"] == int(rodada):
-            source.append((STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_mandante"])),
-                           STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_visitante"])),
-                           int(fixture_time(fixture["data_iso"]).timestamp())))
+            home = STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_mandante"]))
+            away = STATZ_TEAM_TO_ABBR.get(norm(fixture["clube_visitante"]))
+            if (home, away) in invalid_pairs:
+                continue
+            source.append((home, away, int(fixture_time(fixture["data_iso"]).timestamp())))
     if not official or len(set(official)) != len(official) or sorted(official) != sorted(source):
-        raise ValueError("confrontos_ou_horarios_cartola_statz_divergentes")
+        missing = sorted(set(official) - set(source), key=str)
+        extra = sorted(set(source) - set(official), key=str)
+        def describe(items):
+            return "; ".join(f"{h} x {a} ({datetime.fromtimestamp(t, timezone.utc).isoformat()})"
+                             for h, a, t in items) or "nenhum"
+        raise ValueError(
+            "confrontos_ou_horarios_cartola_statz_divergentes: "
+            f"Cartola sem correspondência no Statz: {describe(missing)}. "
+            f"Statz sem correspondência no Cartola: {describe(extra)}. "
+            "Conferir confrontos e horários UTC; jogos explicitamente inválidos no Cartola já foram desconsiderados."
+        )
     now = now or datetime.now(timezone.utc)
     cutoff = min(now, datetime.fromtimestamp(min(x[2] for x in official), timezone.utc))
     # As referências individuais são acumulados atuais, sem filtro histórico na fonte.
@@ -718,7 +736,10 @@ def validate_round_cut(index, cartola, rodada, now=None):
            for f in index.values()):
         raise ValueError("referencias_acumuladas_contem_partidas_posteriores_ao_corte")
     return {"status": "confirmado", "rodada_cartola": int(rodada),
-            "confrontos_confirmados": len(official), "criterio": "mandante_visitante_horario_utc",
+            "confrontos_confirmados": len(official), "criterio": "jogos_validos_cartola_mandante_visitante_horario_utc",
+            "jogos_invalidos_cartola": [{"mandante": h, "visitante": a}
+                                        for h, a in sorted(invalid_pairs)],
+            "regra_jogos_invalidos": "fora_da_comparacao_da_rodada; mantidos_no_historico_brasileirao_se_antes_do_corte",
             "data_corte_exclusiva": cutoff.isoformat(),
             "referencias": "acumulados_atuais_sem_partidas_concluidas_apos_corte"}
 
